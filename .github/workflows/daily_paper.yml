@@ -1,0 +1,28 @@
+name: Daily Paper Agent
+
+on:
+  schedule:
+    - cron: "30 10 * * *"
+      timezone: "Asia/Shanghai"
+  workflow_dispatch:
+
+jobs:
+  run-paper-agent:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run paper agent
+        run: |
+          python paper_agent.py
