@@ -1,6 +1,7 @@
 import os
 import json
 import arxiv
+from datetime import datetime, timezone, timedelta
 from openai import OpenAI
 
 
@@ -12,14 +13,33 @@ KEYWORDS = [
     "3DGS",
     "feed-forward",
     "feedforward",
+    "3D scene generation",
+    "3D scene reconstruction",
+    "3D reconstructions",
+    "Gaussian Splatting Completion",
 ]
 
+DAILY_LOOKBACK_HOURS = 24
 DEEPSEEK_MODEL = "deepseek-v4-flash"
 
 client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com",
 )
+
+
+def is_recent_paper(published_time, lookback_hours: int = DAILY_LOOKBACK_HOURS) -> bool:
+    """
+    Keep only papers published within the recent daily window.
+    """
+    now_utc = datetime.now(timezone.utc)
+
+    if published_time.tzinfo is None:
+        published_time = published_time.replace(tzinfo=timezone.utc)
+    else:
+        published_time = published_time.astimezone(timezone.utc)
+
+    return published_time >= now_utc - timedelta(hours=lookback_hours)
 
 
 def simple_relevance_score(title: str, abstract: str) -> int:
@@ -34,25 +54,45 @@ def simple_relevance_score(title: str, abstract: str) -> int:
         if keyword.lower() in text:
             score += 1
 
+    # Stronger match: NVS + Gaussian representation
     if "novel view synthesis" in text and (
         "gaussian" in text or "3dgs" in text
     ):
         score += 3
 
+    # Stronger match: single-image NVS
     if "single image" in text and "novel view synthesis" in text:
         score += 2
 
+    # Stronger match: feed-forward NVS / Gaussian reconstruction
     if ("feed-forward" in text or "feedforward" in text) and (
         "novel view synthesis" in text or "gaussian" in text
     ):
         score += 2
 
+    # Stronger match: 3D scene reconstruction / generation + Gaussian
+    if (
+        "3d scene reconstruction" in text
+        or "3d scene generation" in text
+        or "3d reconstructions" in text
+    ) and (
+        "gaussian" in text
+        or "splatting" in text
+        or "3dgs" in text
+    ):
+        score += 3
+
+    # Stronger match: Gaussian completion
+    if "gaussian splatting completion" in text:
+        score += 4
+
     return score
 
 
-def search_arxiv(max_results: int = 80):
+def search_arxiv(max_results: int = 150):
     """
-    Search recent arXiv papers from cs.CV using focused NVS / 3DGS keywords.
+    Search recent arXiv papers from cs.CV using focused NVS / 3DGS / 3D scene keywords.
+    Only papers published within DAILY_LOOKBACK_HOURS are kept.
     """
     query = (
         'cat:cs.CV AND ('
@@ -62,7 +102,11 @@ def search_arxiv(max_results: int = 80):
         '"Gaussian splatting" OR '
         '"3DGS" OR '
         '"feed-forward" OR '
-        '"feedforward"'
+        '"feedforward" OR '
+        '"3D scene generation" OR '
+        '"3D scene reconstruction" OR '
+        '"3D reconstructions" OR '
+        '"Gaussian Splatting Completion"'
         ')'
     )
 
@@ -76,24 +120,47 @@ def search_arxiv(max_results: int = 80):
     )
 
     papers = []
+    total_seen = 0
+    old_skipped = 0
+    low_score_skipped = 0
 
     for result in client_arxiv.results(search):
+        total_seen += 1
+
+        if not is_recent_paper(result.published):
+            old_skipped += 1
+            continue
+
         title = result.title.replace("\n", " ").strip()
         abstract = result.summary.replace("\n", " ").strip()
         score = simple_relevance_score(title, abstract)
 
-        if score > 0:
-            papers.append({
-                "title": title,
-                "authors": ", ".join(author.name for author in result.authors[:6]),
-                "published": result.published.strftime("%Y-%m-%d"),
-                "abstract": abstract,
-                "url": result.entry_id,
-                "pdf": result.pdf_url,
-                "keyword_score": score,
-            })
+        if score <= 0:
+            low_score_skipped += 1
+            continue
+
+        papers.append({
+            "title": title,
+            "authors": ", ".join(author.name for author in result.authors[:6]),
+            "published": result.published.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "abstract": abstract,
+            "url": result.entry_id,
+            "pdf": result.pdf_url,
+            "keyword_score": score,
+        })
 
     papers.sort(key=lambda x: x["keyword_score"], reverse=True)
+
+    print("=" * 100)
+    print("arXiv Search Summary")
+    print("=" * 100)
+    print(f"Total arXiv results checked: {total_seen}")
+    print(f"Skipped old papers: {old_skipped}")
+    print(f"Skipped low-score recent papers: {low_score_skipped}")
+    print(f"Kept recent keyword-matched papers: {len(papers)}")
+    print(f"Lookback window: last {DAILY_LOOKBACK_HOURS} hours")
+    print("=" * 100)
+
     return papers
 
 
@@ -106,7 +173,8 @@ You are an expert research assistant in computer vision and 3D reconstruction.
 
 The user's research direction is:
 Single-image novel view synthesis (NVS), feed-forward 3D Gaussian Splatting (3DGS),
-large-view-deviation NVS, efficient feed-forward 3D reconstruction, and 3D Gaussian scene rendering.
+large-view-deviation NVS, efficient feed-forward 3D reconstruction, 3D scene generation,
+3D scene reconstruction, Gaussian Splatting completion, and 3D Gaussian scene rendering.
 
 The user is preparing a NeurIPS-style paper named Spackle.
 The main idea is to mitigate capacity competition in feed-forward 3DGS by freezing
@@ -139,7 +207,7 @@ Please return JSON with the following fields:
 {{
   "relevance_score": 0,
   "reading_priority": "忽略/略读/精读",
-  "category": "single-image NVS / feed-forward 3DGS / 3DGS / NVS / weakly related / unrelated",
+  "category": "single-image NVS / feed-forward 3DGS / 3DGS / NVS / 3D scene generation / 3D scene reconstruction / Gaussian completion / weakly related / unrelated",
   "summary_zh": "",
   "why_relevant_zh": "",
   "technical_takeaway_zh": "",
@@ -193,16 +261,19 @@ Please return JSON with the following fields:
 
 def analyze_papers_with_ai(papers, max_ai_papers: int = 15):
     """
-    Analyze only top keyword-matched papers to control API cost.
+    Analyze only top keyword-matched recent papers to control API cost.
     """
     analyzed = []
+    total_to_analyze = min(len(papers), max_ai_papers)
 
     for idx, paper in enumerate(papers[:max_ai_papers], start=1):
-        print(f"\nAnalyzing paper {idx}/{min(len(papers), max_ai_papers)}: {paper['title']}")
+        print(f"\nAnalyzing paper {idx}/{total_to_analyze}: {paper['title']}")
+
         ai_result = ai_analyze_paper(
             title=paper["title"],
             abstract=paper["abstract"],
         )
+
         paper["ai"] = ai_result
         analyzed.append(paper)
 
@@ -231,6 +302,7 @@ def print_paper_report(papers):
     print("=" * 100)
     print(f"Total AI-analyzed papers: {len(papers)}")
     print(f"Useful papers with relevance_score >= 1: {len(useful_papers)}")
+    print(f"Lookback window: last {DAILY_LOOKBACK_HOURS} hours")
     print("=" * 100)
 
     if not useful_papers:
@@ -277,12 +349,15 @@ def main():
             "Missing DEEPSEEK_API_KEY. Please add it to GitHub Actions Secrets."
         )
 
-    papers = search_arxiv(max_results=80)
+    papers = search_arxiv(max_results=150)
 
-    print(f"Found {len(papers)} keyword-matched papers from arXiv.")
+    print(
+        f"\nFound {len(papers)} keyword-matched papers from arXiv "
+        f"within the last {DAILY_LOOKBACK_HOURS} hours."
+    )
 
     if not papers:
-        print("No candidate papers found.")
+        print("No candidate papers found in the recent window.")
         return
 
     analyzed_papers = analyze_papers_with_ai(
