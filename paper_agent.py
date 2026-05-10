@@ -17,6 +17,8 @@ KEYWORDS = [
     "3D scene reconstruction",
     "3D reconstructions",
     "Gaussian Splatting Completion",
+    "Video Generation",
+    "3D Inpainting"
 ]
 
 DAILY_LOOKBACK_HOURS = 24
@@ -26,6 +28,17 @@ client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com",
 )
+
+
+def build_arxiv_query(keywords):
+    """
+    Build arXiv query automatically from KEYWORDS.
+
+    Example:
+    cat:cs.CV AND ("novel view synthesis" OR "3DGS")
+    """
+    keyword_query = " OR ".join([f'"{kw}"' for kw in keywords])
+    return f"cat:cs.CV AND ({keyword_query})"
 
 
 def is_recent_paper(published_time, lookback_hours: int = DAILY_LOOKBACK_HOURS) -> bool:
@@ -91,24 +104,10 @@ def simple_relevance_score(title: str, abstract: str) -> int:
 
 def search_arxiv(max_results: int = 150):
     """
-    Search recent arXiv papers from cs.CV using focused NVS / 3DGS / 3D scene keywords.
+    Search recent arXiv papers from cs.CV using KEYWORDS.
     Only papers published within DAILY_LOOKBACK_HOURS are kept.
     """
-    query = (
-        'cat:cs.CV AND ('
-        '"novel view synthesis" OR '
-        '"single image novel view synthesis" OR '
-        '"3D Gaussian Splatting" OR '
-        '"Gaussian splatting" OR '
-        '"3DGS" OR '
-        '"feed-forward" OR '
-        '"feedforward" OR '
-        '"3D scene generation" OR '
-        '"3D scene reconstruction" OR '
-        '"3D reconstructions" OR '
-        '"Gaussian Splatting Completion"'
-        ')'
-    )
+    query = build_arxiv_query(KEYWORDS)
 
     client_arxiv = arxiv.Client()
 
@@ -123,6 +122,12 @@ def search_arxiv(max_results: int = 150):
     total_seen = 0
     old_skipped = 0
     low_score_skipped = 0
+
+    print("=" * 100)
+    print("arXiv Query")
+    print("=" * 100)
+    print(query)
+    print("=" * 100)
 
     for result in client_arxiv.results(search):
         total_seen += 1
@@ -166,7 +171,7 @@ def search_arxiv(max_results: int = 150):
 
 def ai_analyze_paper(title: str, abstract: str) -> dict:
     """
-    Use DeepSeek V4 to judge relevance and generate Chinese interpretation.
+    Use DeepSeek to judge relevance and generate Chinese interpretation.
     """
     system_prompt = """
 You are an expert research assistant in computer vision and 3D reconstruction.
