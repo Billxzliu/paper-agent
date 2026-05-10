@@ -1,7 +1,12 @@
 import os
 import json
 import arxiv
+import smtplib
+import html
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from openai import OpenAI
 
 
@@ -18,11 +23,13 @@ KEYWORDS = [
     "3D reconstructions",
     "Gaussian Splatting Completion",
     "Video Generation",
-    "3D Inpainting"
+    "3D Inpainting",
 ]
 
 DAILY_LOOKBACK_HOURS = 24
+MAX_AI_PAPERS = 15
 DEEPSEEK_MODEL = "deepseek-v4-flash"
+TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
@@ -30,12 +37,16 @@ client = OpenAI(
 )
 
 
+def safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
 def build_arxiv_query(keywords):
     """
     Build arXiv query automatically from KEYWORDS.
-
-    Example:
-    cat:cs.CV AND ("novel view synthesis" OR "3DGS")
     """
     keyword_query = " OR ".join([f'"{kw}"' for kw in keywords])
     return f"cat:cs.CV AND ({keyword_query})"
@@ -67,23 +78,19 @@ def simple_relevance_score(title: str, abstract: str) -> int:
         if keyword.lower() in text:
             score += 1
 
-    # Stronger match: NVS + Gaussian representation
     if "novel view synthesis" in text and (
         "gaussian" in text or "3dgs" in text
     ):
         score += 3
 
-    # Stronger match: single-image NVS
     if "single image" in text and "novel view synthesis" in text:
         score += 2
 
-    # Stronger match: feed-forward NVS / Gaussian reconstruction
     if ("feed-forward" in text or "feedforward" in text) and (
         "novel view synthesis" in text or "gaussian" in text
     ):
         score += 2
 
-    # Stronger match: 3D scene reconstruction / generation + Gaussian
     if (
         "3d scene reconstruction" in text
         or "3d scene generation" in text
@@ -95,9 +102,25 @@ def simple_relevance_score(title: str, abstract: str) -> int:
     ):
         score += 3
 
-    # Stronger match: Gaussian completion
     if "gaussian splatting completion" in text:
         score += 4
+
+    if "3d inpainting" in text and (
+        "gaussian" in text
+        or "splatting" in text
+        or "novel view" in text
+        or "3d reconstruction" in text
+    ):
+        score += 3
+
+    if "video generation" in text and (
+        "3d" in text
+        or "scene" in text
+        or "novel view" in text
+        or "camera" in text
+        or "world model" in text
+    ):
+        score += 2
 
     return score
 
@@ -144,10 +167,14 @@ def search_arxiv(max_results: int = 150):
             low_score_skipped += 1
             continue
 
+        published_utc = result.published.astimezone(timezone.utc)
+        published_bj = result.published.astimezone(TIMEZONE)
+
         papers.append({
             "title": title,
             "authors": ", ".join(author.name for author in result.authors[:6]),
-            "published": result.published.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "published_utc": published_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "published_bj": published_bj.strftime("%Y-%m-%d %H:%M:%S Beijing Time"),
             "abstract": abstract,
             "url": result.entry_id,
             "pdf": result.pdf_url,
@@ -174,20 +201,15 @@ def ai_analyze_paper(title: str, abstract: str) -> dict:
     Use DeepSeek to judge relevance and generate Chinese interpretation.
     """
     system_prompt = """
-You are an expert research assistant in computer vision and 3D reconstruction.
+You are an expert research assistant in computer vision, 3D vision, and generative AI.
 
-The user's research direction is:
-Single-image novel view synthesis (NVS), feed-forward 3D Gaussian Splatting (3DGS),
-large-view-deviation NVS, efficient feed-forward 3D reconstruction, 3D scene generation,
-3D scene reconstruction, Gaussian Splatting completion, and 3D Gaussian scene rendering.
-
-The user is preparing a NeurIPS-style paper named Spackle.
-The main idea is to mitigate capacity competition in feed-forward 3DGS by freezing
-a baseline fixed-budget 3DGS model and learning a residual 3DGS branch only for poorly reconstructed
-or disoccluded regions.
+The user's research interests include:
+novel view synthesis (NVS), single-image novel view synthesis, feed-forward 3D Gaussian Splatting (3DGS),
+3D scene reconstruction, 3D scene generation, Gaussian Splatting completion, 3D inpainting,
+video generation, world models, and efficient 3D representation learning.
 
 Your task:
-Given a paper title and abstract, decide whether this paper is relevant to the user's research.
+Given a paper title and abstract, decide whether this paper is relevant to the user's research interests.
 Return your answer in Chinese.
 
 Use this relevance scale:
@@ -196,7 +218,9 @@ Use this relevance scale:
 2 = related, worth reading
 3 = highly related, should read carefully
 
-Be strict. Do not give high scores to general 3D, segmentation, detection, language model, or unrelated generation papers.
+Be strict. Do not give high scores to general segmentation, detection, classification, language model,
+medical imaging, or unrelated generation papers unless they clearly connect to 3D vision, NVS,
+3DGS, 3D reconstruction, 3D generation, 3D inpainting, or video generation.
 
 Return valid JSON only.
 """
@@ -212,11 +236,11 @@ Please return JSON with the following fields:
 {{
   "relevance_score": 0,
   "reading_priority": "忽略/略读/精读",
-  "category": "single-image NVS / feed-forward 3DGS / 3DGS / NVS / 3D scene generation / 3D scene reconstruction / Gaussian completion / weakly related / unrelated",
+  "category": "NVS / single-image NVS / feed-forward 3DGS / 3DGS / 3D scene generation / 3D scene reconstruction / Gaussian completion / 3D inpainting / video generation / world model / weakly related / unrelated",
   "summary_zh": "",
   "why_relevant_zh": "",
   "technical_takeaway_zh": "",
-  "possible_use_for_spackle_zh": "",
+  "research_value_zh": "",
   "limitations_zh": "",
   "final_recommendation_zh": ""
 }}
@@ -245,7 +269,7 @@ Please return JSON with the following fields:
                 "summary_zh": content,
                 "why_relevant_zh": "",
                 "technical_takeaway_zh": "",
-                "possible_use_for_spackle_zh": "",
+                "research_value_zh": "",
                 "limitations_zh": "",
                 "final_recommendation_zh": "",
             }
@@ -258,13 +282,13 @@ Please return JSON with the following fields:
             "summary_zh": f"DeepSeek API error: {str(e)}",
             "why_relevant_zh": "",
             "technical_takeaway_zh": "",
-            "possible_use_for_spackle_zh": "",
+            "research_value_zh": "",
             "limitations_zh": "",
             "final_recommendation_zh": "",
         }
 
 
-def analyze_papers_with_ai(papers, max_ai_papers: int = 15):
+def analyze_papers_with_ai(papers, max_ai_papers: int = MAX_AI_PAPERS):
     """
     Analyze only top keyword-matched recent papers to control API cost.
     """
@@ -284,7 +308,7 @@ def analyze_papers_with_ai(papers, max_ai_papers: int = 15):
 
     analyzed.sort(
         key=lambda x: (
-            int(x["ai"].get("relevance_score", 0)),
+            safe_int(x["ai"].get("relevance_score", 0)),
             x["keyword_score"],
         ),
         reverse=True,
@@ -293,17 +317,21 @@ def analyze_papers_with_ai(papers, max_ai_papers: int = 15):
     return analyzed
 
 
+def get_useful_papers(papers):
+    return [
+        p for p in papers
+        if safe_int(p.get("ai", {}).get("relevance_score", 0)) >= 1
+    ]
+
+
 def print_paper_report(papers):
     """
     Print final report to GitHub Actions logs.
     """
-    useful_papers = [
-        p for p in papers
-        if int(p.get("ai", {}).get("relevance_score", 0)) >= 1
-    ]
+    useful_papers = get_useful_papers(papers)
 
     print("\n" + "=" * 100)
-    print("Daily NVS / 3DGS Paper Agent Report")
+    print("Daily 3D Vision / NVS / 3DGS Paper Agent Report")
     print("=" * 100)
     print(f"Total AI-analyzed papers: {len(papers)}")
     print(f"Useful papers with relevance_score >= 1: {len(useful_papers)}")
@@ -321,7 +349,7 @@ def print_paper_report(papers):
         print(f"[{idx}] {paper['title']}")
         print("=" * 100)
         print(f"Authors: {paper['authors']}")
-        print(f"Published: {paper['published']}")
+        print(f"Published: {paper['published_bj']}")
         print(f"arXiv: {paper['url']}")
         print(f"PDF: {paper['pdf']}")
         print(f"Keyword score: {paper['keyword_score']}")
@@ -338,14 +366,138 @@ def print_paper_report(papers):
         print("\n技术启发:")
         print(ai.get("technical_takeaway_zh", ""))
 
-        print("\n对 Spackle 的潜在价值:")
-        print(ai.get("possible_use_for_spackle_zh", ""))
+        print("\n研究价值:")
+        print(ai.get("research_value_zh", ""))
 
         print("\n可能局限:")
         print(ai.get("limitations_zh", ""))
 
         print("\n最终建议:")
         print(ai.get("final_recommendation_zh", ""))
+
+
+def priority_badge(score: int, priority: str) -> str:
+    if score >= 3:
+        return "🔥 强相关，建议精读"
+    if score == 2:
+        return "✅ 相关，建议阅读"
+    if score == 1:
+        return "👀 弱相关，可快速浏览"
+    return priority or "忽略"
+
+
+def build_email_html(papers):
+    """
+    Build HTML email report.
+    """
+    useful_papers = get_useful_papers(papers)
+    now_bj = datetime.now(TIMEZONE)
+    date_str = now_bj.strftime("%Y-%m-%d")
+
+    html_parts = [
+        "<html>",
+        "<body style='font-family: Arial, sans-serif; line-height: 1.6; color: #222;'>",
+        f"<h2>Daily 3D Vision / NVS / 3DGS Paper Agent Report - {date_str}</h2>",
+        "<p>",
+        f"<b>Total AI-analyzed papers:</b> {len(papers)}<br>",
+        f"<b>Useful papers with relevance_score >= 1:</b> {len(useful_papers)}<br>",
+        f"<b>Lookback window:</b> last {DAILY_LOOKBACK_HOURS} hours<br>",
+        f"<b>Keywords:</b> {html.escape(', '.join(KEYWORDS))}",
+        "</p>",
+    ]
+
+    if not useful_papers:
+        html_parts.extend([
+            "<hr>",
+            "<p>今天没有发现与你方向明显相关的新论文。</p>",
+            "</body>",
+            "</html>",
+        ])
+        return "\n".join(html_parts)
+
+    for idx, paper in enumerate(useful_papers, start=1):
+        ai = paper["ai"]
+        score = safe_int(ai.get("relevance_score", 0))
+        badge = priority_badge(score, ai.get("reading_priority", ""))
+
+        title = html.escape(paper.get("title", ""))
+        authors = html.escape(paper.get("authors", ""))
+        published = html.escape(paper.get("published_bj", ""))
+        category = html.escape(str(ai.get("category", "")))
+        reading_priority = html.escape(str(ai.get("reading_priority", "")))
+
+        summary_zh = html.escape(str(ai.get("summary_zh", ""))).replace("\n", "<br>")
+        why_relevant_zh = html.escape(str(ai.get("why_relevant_zh", ""))).replace("\n", "<br>")
+        technical_takeaway_zh = html.escape(str(ai.get("technical_takeaway_zh", ""))).replace("\n", "<br>")
+        research_value_zh = html.escape(str(ai.get("research_value_zh", ""))).replace("\n", "<br>")
+        limitations_zh = html.escape(str(ai.get("limitations_zh", ""))).replace("\n", "<br>")
+        final_recommendation_zh = html.escape(str(ai.get("final_recommendation_zh", ""))).replace("\n", "<br>")
+
+        arxiv_url = html.escape(paper.get("url", ""))
+        pdf_url = html.escape(paper.get("pdf", ""))
+
+        html_parts.append(f"""
+        <div style="border-top: 1px solid #ddd; padding: 18px 0;">
+            <h3>[{idx}] {html.escape(badge)}</h3>
+            <h2 style="font-size: 18px;">{title}</h2>
+
+            <p>
+                <b>Authors:</b> {authors}<br>
+                <b>Published:</b> {published}<br>
+                <b>Keyword score:</b> {paper.get("keyword_score", 0)}<br>
+                <b>AI relevance score:</b> {score}<br>
+                <b>Reading priority:</b> {reading_priority}<br>
+                <b>Category:</b> {category}
+            </p>
+
+            <p><b>中文解读：</b><br>{summary_zh}</p>
+            <p><b>为什么相关：</b><br>{why_relevant_zh}</p>
+            <p><b>技术启发：</b><br>{technical_takeaway_zh}</p>
+            <p><b>研究价值：</b><br>{research_value_zh}</p>
+            <p><b>可能局限：</b><br>{limitations_zh}</p>
+            <p><b>最终建议：</b><br>{final_recommendation_zh}</p>
+
+            <p>
+                <a href="{arxiv_url}">arXiv 页面</a> |
+                <a href="{pdf_url}">PDF</a>
+            </p>
+        </div>
+        """)
+
+    html_parts.extend([
+        "</body>",
+        "</html>",
+    ])
+
+    return "\n".join(html_parts)
+
+
+def send_email(subject: str, html_content: str):
+    """
+    Send HTML email via Gmail SMTP.
+
+    Required GitHub Secrets:
+    EMAIL_USER, EMAIL_PASSWORD, TO_EMAIL
+    """
+    email_user = os.getenv("EMAIL_USER")
+    email_password = os.getenv("EMAIL_PASSWORD")
+    to_email = os.getenv("TO_EMAIL")
+
+    if not email_user or not email_password or not to_email:
+        raise RuntimeError(
+            "Missing email settings. Please set EMAIL_USER, EMAIL_PASSWORD, and TO_EMAIL in GitHub Secrets."
+        )
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = email_user
+    msg["To"] = to_email
+
+    msg.attach(MIMEText(html_content, "html", "utf-8"))
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(email_user, email_password)
+        server.sendmail(email_user, to_email, msg.as_string())
 
 
 def main():
@@ -362,15 +514,23 @@ def main():
     )
 
     if not papers:
-        print("No candidate papers found in the recent window.")
-        return
-
-    analyzed_papers = analyze_papers_with_ai(
-        papers=papers,
-        max_ai_papers=15,
-    )
+        analyzed_papers = []
+    else:
+        analyzed_papers = analyze_papers_with_ai(
+            papers=papers,
+            max_ai_papers=MAX_AI_PAPERS,
+        )
 
     print_paper_report(analyzed_papers)
+
+    today_bj = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    useful_count = len(get_useful_papers(analyzed_papers))
+
+    subject = f"Daily 3D Vision Paper Agent - {today_bj} - {useful_count} useful papers"
+    html_content = build_email_html(analyzed_papers)
+    send_email(subject, html_content)
+
+    print("Email sent successfully.")
 
 
 if __name__ == "__main__":
