@@ -400,6 +400,109 @@ def render_clip_to_png(page, clip, output_path: str):
         return None
 
 
+def horizontal_overlap(rect_a, rect_b) -> float:
+    return max(0, min(rect_a.x1, rect_b.x1) - max(rect_a.x0, rect_b.x0))
+
+
+def rect_area(rect) -> float:
+    return max(0, rect.width) * max(0, rect.height)
+
+
+def rect_flag(rect, name: str) -> bool:
+    value = getattr(rect, name, False)
+    return bool(value() if callable(value) else value)
+
+
+def find_visual_rect_above_caption(page, caption_rect, page_rect, text_blocks):
+    import fitz
+
+    candidates = []
+    if caption_rect.width < page_rect.width * 0.75:
+        figure_band = fitz.Rect(
+            max(page_rect.x0, caption_rect.x0 - 36),
+            page_rect.y0,
+            min(page_rect.x1, caption_rect.x1 + 36),
+            caption_rect.y0,
+        )
+    else:
+        figure_band = fitz.Rect(
+            page_rect.x0,
+            page_rect.y0,
+            page_rect.x1,
+            caption_rect.y0,
+        )
+
+    for block in text_blocks:
+        if block.get("type") != 1:
+            continue
+
+        rect = fitz.Rect(block["bbox"])
+        if rect_area(rect) >= 4000:
+            candidates.append(rect)
+
+    for image in page.get_images(full=True):
+        xref = image[0]
+        try:
+            candidates.extend(page.get_image_rects(xref))
+        except Exception:
+            continue
+
+    for drawing in page.get_drawings():
+        rect = drawing.get("rect")
+        if not rect:
+            continue
+
+        rect = fitz.Rect(rect)
+        if rect_area(rect) >= 1200 and rect.width >= 20 and rect.height >= 8:
+            candidates.append(rect)
+
+    filtered = []
+    for rect in candidates:
+        if rect_flag(rect, "is_empty") or rect_flag(rect, "is_infinite"):
+            continue
+        if rect.y1 > caption_rect.y0 + 3:
+            continue
+        if rect.y1 < page_rect.y0 + 24:
+            continue
+        if horizontal_overlap(rect, figure_band) < min(40, rect.width * 0.25):
+            continue
+
+        gap_to_caption = caption_rect.y0 - rect.y1
+        if gap_to_caption > page_rect.height * 0.35:
+            continue
+
+        filtered.append(rect)
+
+    if not filtered:
+        return None
+
+    filtered.sort(key=lambda rect: rect.y1, reverse=True)
+    visual_rect = filtered[0]
+    max_join_gap = 28
+
+    for rect in filtered[1:]:
+        if rect.y1 < visual_rect.y0 - max_join_gap:
+            continue
+
+        expanded_visual = fitz.Rect(
+            visual_rect.x0 - 12,
+            visual_rect.y0 - max_join_gap,
+            visual_rect.x1 + 12,
+            visual_rect.y1,
+        )
+        if horizontal_overlap(rect, expanded_visual) <= 0:
+            continue
+
+        visual_rect = fitz.Rect(
+            min(visual_rect.x0, rect.x0),
+            min(visual_rect.y0, rect.y0),
+            max(visual_rect.x1, rect.x1),
+            max(visual_rect.y1, rect.y1),
+        )
+
+    return visual_rect
+
+
 def extract_figure_by_caption(document, output_path: str):
     import fitz
 
@@ -408,8 +511,9 @@ def extract_figure_by_caption(document, output_path: str):
     for page_index in range(min(len(document), MAX_FIGURE_PAGES)):
         page = document[page_index]
         page_rect = page.rect
+        text_blocks = page.get_text("dict").get("blocks", [])
 
-        for block in page.get_text("dict").get("blocks", []):
+        for block in text_blocks:
             if block.get("type") != 0:
                 continue
 
@@ -433,8 +537,21 @@ def extract_figure_by_caption(document, output_path: str):
                 x0 = page_rect.x0
                 x1 = page_rect.x1
 
-            y1 = max(page_rect.y0 + 80, caption_rect.y0 - 6)
-            y0 = max(page_rect.y0, y1 - page_rect.height * 0.48)
+            visual_rect = find_visual_rect_above_caption(
+                page=page,
+                caption_rect=caption_rect,
+                page_rect=page_rect,
+                text_blocks=text_blocks,
+            )
+
+            if visual_rect:
+                x0 = max(page_rect.x0, min(x0, visual_rect.x0) - 10)
+                x1 = min(page_rect.x1, max(x1, visual_rect.x1) + 10)
+                y0 = max(page_rect.y0, visual_rect.y0 - 10)
+            else:
+                y0 = max(page_rect.y0, caption_rect.y0 - min(page_rect.height * 0.32, 260))
+
+            y1 = min(page_rect.y1, caption_rect.y1 + 12)
 
             if y1 - y0 < 80 or x1 - x0 < 120:
                 continue
