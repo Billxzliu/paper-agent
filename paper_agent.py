@@ -3,10 +3,13 @@ import json
 import arxiv
 import smtplib
 import html
+import re
+import urllib.request
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
 from openai import OpenAI
 
 
@@ -28,6 +31,11 @@ KEYWORDS = [
 
 DAILY_LOOKBACK_HOURS = 24
 MAX_AI_PAPERS = 15
+MIN_FINAL_RELEVANCE_SCORE = 2
+MAX_DAILY_PUSH_PAPERS = 5
+FIGURE_CACHE_DIR = "paper_figures"
+MAX_FIGURE_PAGES = 4
+MIN_FIGURE_AREA = 120000
 DEEPSEEK_MODEL = "deepseek-v4-flash"
 TIMEZONE = ZoneInfo("Asia/Shanghai")
 
@@ -214,13 +222,17 @@ Return your answer in Chinese.
 
 Use this relevance scale:
 0 = unrelated, ignore
-1 = weakly related, maybe scan
-2 = related, worth reading
-3 = highly related, should read carefully
+1 = weakly related or only shares broad keywords, do not recommend in the daily email
+2 = directly related, worth reading
+3 = highly related to NVS / 3DGS / 3D generation / reconstruction, should read carefully
 
 Be strict. Do not give high scores to general segmentation, detection, classification, language model,
 medical imaging, or unrelated generation papers unless they clearly connect to 3D vision, NVS,
 3DGS, 3D reconstruction, 3D generation, 3D inpainting, or video generation.
+
+Only assign score 2 or 3 when the title or abstract contains concrete technical evidence that the paper
+solves, improves, evaluates, or substantially uses one of the user's core research topics. If the connection
+is just a possible application or a shared buzzword, assign score 1 or 0.
 
 Return valid JSON only.
 """
@@ -318,10 +330,228 @@ def analyze_papers_with_ai(papers, max_ai_papers: int = MAX_AI_PAPERS):
 
 
 def get_useful_papers(papers):
-    return [
+    useful_papers = [
         p for p in papers
-        if safe_int(p.get("ai", {}).get("relevance_score", 0)) >= 1
+        if safe_int(p.get("ai", {}).get("relevance_score", 0)) >= MIN_FINAL_RELEVANCE_SCORE
     ]
+
+    useful_papers.sort(
+        key=lambda x: (
+            safe_int(x.get("ai", {}).get("relevance_score", 0)),
+            x.get("keyword_score", 0),
+        ),
+        reverse=True,
+    )
+
+    return useful_papers[:MAX_DAILY_PUSH_PAPERS]
+
+
+def safe_filename(value: str) -> str:
+    filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_")
+    return filename[:100] or "paper"
+
+
+def paper_id_from_url(url: str) -> str:
+    paper_id = url.rstrip("/").split("/")[-1] if url else "paper"
+    return safe_filename(paper_id)
+
+
+def download_pdf(pdf_url: str, pdf_path: str) -> bool:
+    if not pdf_url:
+        return False
+
+    os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
+
+    try:
+        request = urllib.request.Request(
+            pdf_url,
+            headers={"User-Agent": "paper-agent/1.0"},
+        )
+        with urllib.request.urlopen(request, timeout=45) as response:
+            with open(pdf_path, "wb") as file:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    file.write(chunk)
+        return True
+    except Exception as e:
+        print(f"Failed to download PDF: {pdf_url} ({e})")
+        return False
+
+
+def render_clip_to_png(page, clip, output_path: str):
+    try:
+        import fitz
+
+        pixmap = page.get_pixmap(
+            matrix=fitz.Matrix(2, 2),
+            clip=clip,
+            alpha=False,
+        )
+
+        if pixmap.width * pixmap.height < MIN_FIGURE_AREA:
+            return None
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        pixmap.save(output_path)
+        return output_path
+    except Exception:
+        return None
+
+
+def extract_figure_by_caption(document, output_path: str):
+    import fitz
+
+    caption_pattern = re.compile(r"\b(fig\.?|figure)\s*1\b", re.IGNORECASE)
+
+    for page_index in range(min(len(document), MAX_FIGURE_PAGES)):
+        page = document[page_index]
+        page_rect = page.rect
+
+        for block in page.get_text("dict").get("blocks", []):
+            if block.get("type") != 0:
+                continue
+
+            block_text_parts = []
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    block_text_parts.append(span.get("text", ""))
+
+            block_text = " ".join(block_text_parts)
+            if not caption_pattern.search(block_text):
+                continue
+
+            caption_rect = fitz.Rect(block["bbox"])
+            if caption_rect.y0 < page_rect.height * 0.15:
+                continue
+
+            if caption_rect.width < page_rect.width * 0.75:
+                x0 = max(page_rect.x0, caption_rect.x0 - 16)
+                x1 = min(page_rect.x1, caption_rect.x1 + 16)
+            else:
+                x0 = page_rect.x0
+                x1 = page_rect.x1
+
+            y1 = max(page_rect.y0 + 80, caption_rect.y0 - 6)
+            y0 = max(page_rect.y0, y1 - page_rect.height * 0.48)
+
+            if y1 - y0 < 80 or x1 - x0 < 120:
+                continue
+
+            extracted = render_clip_to_png(
+                page=page,
+                clip=fitz.Rect(x0, y0, x1, y1),
+                output_path=output_path,
+            )
+            if extracted:
+                return extracted
+
+    return None
+
+
+def extract_largest_pdf_image(document, output_path: str):
+    import fitz
+
+    best = None
+    seen_xrefs = set()
+
+    for page_index in range(min(len(document), MAX_FIGURE_PAGES)):
+        page = document[page_index]
+
+        for image in page.get_images(full=True):
+            xref = image[0]
+            if xref in seen_xrefs:
+                continue
+
+            seen_xrefs.add(xref)
+
+            try:
+                pixmap = fitz.Pixmap(document, xref)
+                width = pixmap.width
+                height = pixmap.height
+                area = width * height
+            except Exception:
+                continue
+
+            if width < 250 or height < 120 or area < MIN_FIGURE_AREA:
+                continue
+
+            score = area - page_index * 50000
+            if best is None or score > best["score"]:
+                best = {"xref": xref, "score": score}
+
+    if not best:
+        return None
+
+    try:
+        pixmap = fitz.Pixmap(document, best["xref"])
+        if pixmap.n >= 5:
+            pixmap = fitz.Pixmap(fitz.csRGB, pixmap)
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        pixmap.save(output_path)
+        return output_path
+    except Exception:
+        return None
+
+
+def extract_overview_figure(paper):
+    paper_id = paper_id_from_url(paper.get("url", ""))
+    pdf_path = os.path.join(FIGURE_CACHE_DIR, "pdfs", f"{paper_id}.pdf")
+    image_path = os.path.join(FIGURE_CACHE_DIR, "images", f"{paper_id}.png")
+
+    if os.path.exists(image_path):
+        return image_path
+
+    if not os.path.exists(pdf_path) and not download_pdf(paper.get("pdf", ""), pdf_path):
+        return None
+
+    try:
+        import fitz
+    except ImportError:
+        print("PyMuPDF is not installed; skip overview figure extraction.")
+        return None
+
+    try:
+        with fitz.open(pdf_path) as document:
+            return (
+                extract_figure_by_caption(document, image_path)
+                or extract_largest_pdf_image(document, image_path)
+            )
+    except Exception as e:
+        print(f"Failed to extract overview figure for {paper.get('title', '')}: {e}")
+        return None
+
+
+def add_overview_figures(papers):
+    for idx, paper in enumerate(get_useful_papers(papers), start=1):
+        print(f"Extracting overview figure {idx}: {paper.get('title', '')}")
+
+        figure_path = extract_overview_figure(paper)
+        if not figure_path:
+            print("No overview figure extracted; continue without image.")
+            continue
+
+        paper_id = paper_id_from_url(paper.get("url", ""))
+        paper["figure_path"] = figure_path
+        paper["figure_cid"] = f"overview-{paper_id}@paper-agent"
+
+
+def collect_inline_images(papers):
+    inline_images = []
+
+    for paper in get_useful_papers(papers):
+        figure_path = paper.get("figure_path")
+        figure_cid = paper.get("figure_cid")
+
+        if figure_path and figure_cid and os.path.exists(figure_path):
+            inline_images.append({
+                "path": figure_path,
+                "cid": figure_cid,
+            })
+
+    return inline_images
 
 
 def print_paper_report(papers):
@@ -334,7 +564,10 @@ def print_paper_report(papers):
     print("Daily 3D Vision / NVS / 3DGS Paper Agent Report")
     print("=" * 100)
     print(f"Total AI-analyzed papers: {len(papers)}")
-    print(f"Useful papers with relevance_score >= 1: {len(useful_papers)}")
+    print(
+        f"Recommended papers with relevance_score >= {MIN_FINAL_RELEVANCE_SCORE}: "
+        f"{len(useful_papers)} / max {MAX_DAILY_PUSH_PAPERS}"
+    )
     print(f"Lookback window: last {DAILY_LOOKBACK_HOURS} hours")
     print("=" * 100)
 
@@ -400,7 +633,10 @@ def build_email_html(papers):
         f"<h2>Daily 3D Vision / NVS / 3DGS Paper Agent Report - {date_str}</h2>",
         "<p>",
         f"<b>Total AI-analyzed papers:</b> {len(papers)}<br>",
-        f"<b>Useful papers with relevance_score >= 1:</b> {len(useful_papers)}<br>",
+        (
+            f"<b>Recommended papers with relevance_score >= {MIN_FINAL_RELEVANCE_SCORE}:</b> "
+            f"{len(useful_papers)} / max {MAX_DAILY_PUSH_PAPERS}<br>"
+        ),
         f"<b>Lookback window:</b> last {DAILY_LOOKBACK_HOURS} hours<br>",
         f"<b>Keywords:</b> {html.escape(', '.join(KEYWORDS))}",
         "</p>",
@@ -435,6 +671,17 @@ def build_email_html(papers):
 
         arxiv_url = html.escape(paper.get("url", ""))
         pdf_url = html.escape(paper.get("pdf", ""))
+        figure_html = ""
+
+        if paper.get("figure_cid"):
+            figure_cid = html.escape(str(paper["figure_cid"]))
+            figure_html = f"""
+            <p>
+                <b>Overview figure:</b><br>
+                <img src="cid:{figure_cid}" alt="Overview figure for {title}"
+                     style="max-width: 100%; height: auto; border: 1px solid #ddd;">
+            </p>
+            """
 
         html_parts.append(f"""
         <div style="border-top: 1px solid #ddd; padding: 18px 0;">
@@ -449,6 +696,8 @@ def build_email_html(papers):
                 <b>Reading priority:</b> {reading_priority}<br>
                 <b>Category:</b> {category}
             </p>
+
+            {figure_html}
 
             <p><b>中文解读：</b><br>{summary_zh}</p>
             <p><b>为什么相关：</b><br>{why_relevant_zh}</p>
@@ -472,7 +721,7 @@ def build_email_html(papers):
     return "\n".join(html_parts)
 
 
-def send_email(subject: str, html_content: str):
+def send_email(subject: str, html_content: str, inline_images=None):
     """
     Send HTML email via Gmail SMTP.
 
@@ -488,12 +737,31 @@ def send_email(subject: str, html_content: str):
             "Missing email settings. Please set EMAIL_USER, EMAIL_PASSWORD, and TO_EMAIL in GitHub Secrets."
         )
 
-    msg = MIMEMultipart("alternative")
+    inline_images = inline_images or []
+
+    msg = MIMEMultipart("related")
     msg["Subject"] = subject
     msg["From"] = email_user
     msg["To"] = to_email
 
-    msg.attach(MIMEText(html_content, "html", "utf-8"))
+    alternative = MIMEMultipart("alternative")
+    alternative.attach(MIMEText(html_content, "html", "utf-8"))
+    msg.attach(alternative)
+
+    for image in inline_images:
+        try:
+            with open(image["path"], "rb") as file:
+                mime_image = MIMEImage(file.read())
+
+            mime_image.add_header("Content-ID", f"<{image['cid']}>")
+            mime_image.add_header(
+                "Content-Disposition",
+                "inline",
+                filename=os.path.basename(image["path"]),
+            )
+            msg.attach(mime_image)
+        except Exception as e:
+            print(f"Failed to attach inline image {image.get('path', '')}: {e}")
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(email_user, email_password)
@@ -522,13 +790,15 @@ def main():
         )
 
     print_paper_report(analyzed_papers)
+    add_overview_figures(analyzed_papers)
 
     today_bj = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
     useful_count = len(get_useful_papers(analyzed_papers))
 
     subject = f"Daily 3D Vision Paper Agent - {today_bj} - {useful_count} useful papers"
     html_content = build_email_html(analyzed_papers)
-    send_email(subject, html_content)
+    inline_images = collect_inline_images(analyzed_papers)
+    send_email(subject, html_content, inline_images=inline_images)
 
     print("Email sent successfully.")
 
